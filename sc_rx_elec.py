@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Analyse réseau unifiée (Module1 pandapower + Module2 ESS (Pyomo ou heuristique))
-- Lecture multi-feuilles depuis Donnees.xlsx
-- Construction réseau (buses, transfo, lignes, charges, PV, ESS)
-- Scénarios : base (0%), PV, PV+ESS
-- Option optimisation ESS Pyomo (si GLPK dispo) ou heuristique
-- Visualisations (seaborn/matplotlib) : line, comparative, bar, heatmap, radar, 3D surface, 2D
-- Sauvegarde PNG dans outputs/
-- Exports JSON/CSV
+sc_rx_elec_singlefile.py
+Script unifié : données en dur (dictionnaires) -> réseau pandapower -> scénarios PV (0,20,50%) -> ESS (optimisation multi-periode via Pyomo ou heuristique)
+Génère 14 graphiques dans outputs/
+Labels/legendes en français, fichiers en anglais.
 """
+
 from __future__ import annotations
-import os, sys, math, json, traceback
-from typing import Dict, Any, Tuple, List
+import os, copy, math, json, traceback
+from typing import Dict, List, Tuple, Any
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from matplotlib import cm
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-# Optional heavy imports (load lazily / with clear messages)
+# heavy optional imports
 try:
     import pandapower as pp
 except Exception as e:
@@ -33,801 +29,850 @@ except Exception as e:
     pyo = None
     _pyo_err = e
 
-sns.set(style="whitegrid", palette="muted", font_scale=1.05)
-plt.rcParams["figure.dpi"] = 120
-
-# -----------------------
-# Configuration
-# -----------------------
-INPUT_XLSX = "data.xlsx"
-INPUT_CSV_FALLBACK = "data.csv"
+# ---------------------------
+# Simulation settings & DATA
+# ---------------------------
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+sns.set_theme(style="whitegrid", font_scale=1.05)
+plt.rcParams["figure.dpi"] = 120
 
-PV_RATIO_DEFAULT = 0.20   # 20% injection default
-ESS_CAP_kWh_DEFAULT = 20.0
-ESS_Pmax_kW_DEFAULT = 4.0
-SAVE_FIGURES = True
-VERBOSE = True
+# SimulationSettings (weights from article -> user-specified)
+SimulationSettings = {
+    "weights": {"w1": 0.5, "w2": 0.4, "w3": 0.1},    # ω1, ω2, ω3
+    "k_V_per_kW": 0.002,       # pu per kW ESS impact on local voltage (paramétrable)
+    "k_loss_per_kW": 0.02,     # kW losses reduction per kW ESS dispatched (proxy)
+    "timesteps": ["2025-09-22 06:00", "2025-09-22 09:00", "2025-09-22 12:00", "2025-09-22 15:00", "2025-09-22 18:00"]
+}
 
-# -----------------------
-# Utilities
-# -----------------------
+# === données intégrées (tes dictionnaires) ===
+buses = [
+    {"bus": "B1", "depart": 0, "vn_kv": 0.4, "is_slack": 1},
+    {"bus": "B2", "depart": 1, "vn_kv": 0.4, "is_slack": 0},
+    {"bus": "B3", "depart": 2, "vn_kv": 0.4, "is_slack": 0},
+    {"bus": "B4", "depart": 3, "vn_kv": 0.4, "is_slack": 0},
+    {"bus": "B5", "depart": 4, "vn_kv": 0.4, "is_slack": 0},
+    {"bus": "B6", "depart": 5, "vn_kv": 0.4, "is_slack": 0},
+]
+
+transformer = [
+    {
+        "trafo_id": "T1",
+        "sn_kva": 630,
+        "vn_hv_kv": 15,
+        "vn_lv_kv": 0.4,
+        "vk_percent": 6,
+        "vkr_percent": 1.2,
+        "pfe_kw": 1.2,
+        "vector_group": "Dyn11",
+    }
+]
+
+line = [
+    {"line_id": "L1", "from_bus": "B1", "to_bus": "B2", "length_m": 607.8, "section_mm2": 110, "r_ohm_per_km": 0.65, "x_ohm_per_km": 0.412},
+    {"line_id": "L2", "from_bus": "B1", "to_bus": "B3", "length_m": 524.3, "section_mm2": 110, "r_ohm_per_km": 0.65, "x_ohm_per_km": 0.412},
+    {"line_id": "L3", "from_bus": "B1", "to_bus": "B4", "length_m": 111.9, "section_mm2": 35, "r_ohm_per_km": 0.65, "x_ohm_per_km": 0.412},
+    {"line_id": "L4", "from_bus": "B1", "to_bus": "B5", "length_m": 420,   "section_mm2": 110, "r_ohm_per_km": 0.65, "x_ohm_per_km": 0.412},
+    {"line_id": "L5", "from_bus": "B1", "to_bus": "B6", "length_m": 1145, "section_mm2": 110, "r_ohm_per_km": 0.65, "x_ohm_per_km": 0.412},
+]
+
+limits = {
+    "vmin_pu": 0.95,
+    "vmax_pu": 1.05,
+    "i_loading_max_percent": 100,
+    "vuf_max_percent": 3
+}
+
+pv_static = [
+    {"pv_id": "PV1", "bus": "B1", "phase": "A", "p_stc_kw": 5, "s_max_kva": 5.5},
+    {"pv_id": "PV2", "bus": "B1", "phase": "B", "p_stc_kw": 5, "s_max_kva": 5.5},
+    {"pv_id": "PV3", "bus": "B1", "phase": "C", "p_stc_kw": 5, "s_max_kva": 5.5},
+]
+
+ess = [
+    {"ess_id": "ESS1", "bus": "B1", "phase": "3ph", "e_cap_kwh": 20, "p_max_kw_per_phase": 4, "eta_charge": 0.94, "eta_discharge": 0.94, "soc_init_percent": 50},
+    {"ess_id": "ESS2", "bus": "B1", "phase": "3ph", "e_cap_kwh": 20, "p_max_kw_per_phase": 4, "eta_charge": 0.94, "eta_discharge": 0.94, "soc_init_percent": 50},
+]
+
+load_timeseries = [
+    {"time": "2025-09-22 06:00", "bus": "B5", "phase": "A", "p_kw": 20, "q_kvar": 5},
+    {"time": "2025-09-22 07:00", "bus": "B5", "phase": "B", "p_kw": 22, "q_kvar": 5.2},
+    {"time": "2025-09-22 08:00", "bus": "B5", "phase": "C", "p_kw": 18, "q_kvar": 4.8},
+]
+
+pv_timeseries = [
+    {"time": "2025-09-22 06:00", "pv_id": "PV1", "p_kw": 0,   "q_kvar": 0},
+    {"time": "2025-09-22 12:00", "pv_id": "PV1", "p_kw": 4.5, "q_kvar": 0},
+    {"time": "2025-09-22 18:00", "pv_id": "PV1", "p_kw": 0.1, "q_kvar": 0},
+]
+
+results_before = [
+    {"bus": "B12", "phase": "A", "v_pu": 0.93, "i_line_A": 138, "vuf_percent": 7.1, "losses_kW_branch": 1.2},
+    {"bus": "B12", "phase": "B", "v_pu": 0.96, "i_line_A": 146, "vuf_percent": 7.1, "losses_kW_branch": 1.1},
+    {"bus": "B12", "phase": "C", "v_pu": 0.94, "i_line_A": 132, "vuf_percent": 7.1, "losses_kW_branch": 1.05}
+]
+
+# ---------------------------
+# Utilitaires
+# ---------------------------
 def debug(msg: str):
-    if VERBOSE:
-        print(msg)
+    print(msg)
 
 def safe_float(x, default=0.0):
     try:
-        if pd.isna(x):
-            return default
-        s = str(x).strip()
-        s = s.replace(";", ".").replace(" ", "")
-        # handle European thousands
-        if s.count('.') > 1 and ',' in s:
-            s = s.replace('.', '').replace(',', '.')
-        else:
-            s = s.replace(',', '.')
+        if x is None: return default
+        s = str(x).strip().replace(',', '.').replace(';', '.')
         return float(s)
     except Exception:
         return default
 
-def find_input():
-    if os.path.exists(INPUT_XLSX):
-        return INPUT_XLSX
-    if os.path.exists(INPUT_CSV_FALLBACK):
-        return INPUT_CSV_FALLBACK
-    raise FileNotFoundError(f"Data file not found: {INPUT_XLSX} or {INPUT_CSV_FALLBACK}")
-
-def save_fig(fig: plt.Figure, name: str):
-    path = os.path.join(OUTPUT_DIR, f"{name}.png")
-    try:
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        debug(f"Saved figure -> {path}")
-    except Exception as e:
-        debug(f"[WARN] Could not save figure {name}: {e}")
-
-# -----------------------
-# Data loading
-# -----------------------
-def load_all_sheets(path: str) -> Dict[str, pd.DataFrame]:
-    debug(f"Reading input file: {path}")
-    if path.lower().endswith(".csv"):
-        # fallback: single-sheet csv -> put in 'data_phase'
-        df = pd.read_csv(path, dtype=str)
-        df = df.applymap(lambda v: safe_float(v, np.nan))
-        return {"data_phase": df}
-    # excel
-    xls = pd.ExcelFile(path)
-    sheets = {}
-    for sheet in xls.sheet_names:
-        try:
-            df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
-            # normalize whitespace column names
-            df.columns = [str(c).strip() if c is not None else "" for c in df.columns]
-            # convert numeric-like strings to floats where possible
-            df = df.applymap(lambda v: safe_float(v, np.nan) if isinstance(v, str) else v)
-            sheets[sheet.strip().lower()] = df
-            debug(f" - loaded sheet '{sheet}' shape={df.shape}")
-        except Exception as e:
-            debug(f"[WARN] Could not read sheet {sheet}: {e}")
-    return sheets
-
-# -----------------------
-# Build pandapower network
-# -----------------------
 def check_pandapower():
     if pp is None:
-        raise ImportError(f"pandapower not available: {_pp_err}")
+        raise ImportError(f"pandapower non disponible: {_pp_err}")
 
-def check_pandapower():
+# ---------------------------
+# Construction réseau (pandapower) - données en dur
+# ---------------------------
+def build_network_from_dicts():
+    """
+    Construire un réseau pandapower à partir des dictionnaires définis plus haut.
+    Retour: net, bus_map (label -> idx), pv_map (bus_idx -> kw), ess_map
+    """
     if pp is None:
-        raise ImportError(f"pandapower not available: {_pp_err}")
-
-def create_network_from_sheets(sheets: Dict[str, pd.DataFrame]):
-    """
-    Build pandapower network using provided sheets. Expect sheets:
-    data_phase, transformer, buses, line, limits, pv_static, ess, load_timeseries, pv_timeseries
-    """
-    check_pandapower()
+        debug("[WARN] pandapower non installé, le PF ne sera pas exécuté.")
+        # return placeholders
+        return None, {}, {}, {}
     net = pp.create_empty_network()
-
-    # Buses sheet
-    buses_df = sheets.get("buses")
-    bus_map = {}
-
-
-
-    if buses_df is None:
-        debug("[WARN] 'buses' sheet not found -> building buses from unique 'Départ' in data_phase.")
-        data_phase = sheets.get("data_phase")
-        if data_phase is None:
-            raise ValueError("No data_phase and no buses sheet.")
-        departures = sorted(list(data_phase["Départ"].dropna().unique()))
-        for i, dep in enumerate(departures):
-            bus_map[dep] = pp.create_bus(net, vn_kv=0.4, name=f"Bus_{dep}")
-        debug(f"Created {len(bus_map)} buses from data_phase.")
-    else:
-        # Normaliser colonnes
-        buses_df.columns = [c.strip().lower() for c in buses_df.columns]
-
-        # Conversion des nombres avec virgules en points
-        for col in ["vn_kv", "is_slack"]:
-            if col in buses_df.columns:
-                buses_df[col] = buses_df[col].astype(str).str.replace(",", ".").astype(float)
-
-        for _, r in buses_df.iterrows():
-            try:
-                label = r.get("bus")
-                if pd.isna(label):
-                    continue
-                vn_kv = r.get("vn_kv", 0.4)
-                bus_idx = pp.create_bus(net, vn_kv=float(vn_kv), name=str(label))
-                bus_map[label] = bus_idx
-
-                if int(r.get("is_slack", 0)) == 1:
-                    pp.create_ext_grid(net, bus=bus_idx, vm_pu=1.0, name="Slack")
-
-            except Exception as e:
-                print(f"[WARN] Ligne bus ignorée: {r.to_dict()} | Erreur: {e}")
-
-        if len(bus_map) == 0:
-            print("[WARN] Aucun bus valide trouvé → génération automatique depuis data_phase.")
-            data_phase = sheets.get("data_phase")
-            if data_phase is not None:
-                for i, dep in enumerate(sorted(list(data_phase["Départ"].dropna().unique()))):
-                    bus_map[dep] = pp.create_bus(net, vn_kv=0.4, name=f"Bus_{dep}")
-                pp.create_ext_grid(net, bus=list(bus_map.values())[0], vm_pu=1.0, name="Slack")
-            else:
-                raise ValueError("Impossible de créer des bus: aucune donnée disponible.")
-        debug(f"Created {len(bus_map)} buses from 'buses' sheet.")
-
-
-    # Transformer
-    trafo_df = sheets.get("transformer")
-    if trafo_df is not None and not trafo_df.empty:
-        row = trafo_df.iloc[0]
-        sn_kva = safe_float(row.get("sn_kva", row.get("sn_kva", None)), None)
-        vn_hv_kv = safe_float(row.get("vn_hv_kv", 15.0), 15.0)
-        vn_lv_kv = safe_float(row.get("vn_lv_kv", 0.4), 0.4)
-        vk_percent = safe_float(row.get("vk_percent", 6.0), 6.0)
-        vkr_percent = safe_float(row.get("vkr_percent", 0.5), 0.5)
-        # create high-voltage and low-voltage bus if needed
-        # For simplicity, map HV to external grid bus and LV to bus of first entry
-        # create an ext_grid at the LV bus of first bus in bus_map
+    bus_map: Dict[str,int] = {}
+    # create buses
+    for b in buses:
         try:
-            # create external grid later after buses exist
-            debug("Transformer data present; will reference in net as ext_grid on first LV bus.")
-        except Exception:
-            pass
-
-    # create ext_grid on first bus
-    if len(bus_map) == 0:
-        raise ValueError("No buses available to create external grid.")
-    first_bus = list(bus_map.values())[0]
-    try:
-        pp.create_ext_grid(net, bus=first_bus, vm_pu=1.0, name="Slack")
-    except Exception as e:
-        debug(f"[WARN] create_ext_grid failed: {e}")
-
-    # Lines sheet
-    line_df = sheets.get("line")
-    if line_df is not None:
-        for _, r in line_df.iterrows():
-            try:
-                from_bus_label = r.get("from_bus")
-                to_bus_label = r.get("to_bus")
-                # resolve if bus label provided like 'B1'
-                if from_bus_label not in bus_map:
-                    # try string match
-                    keys = [k for k in bus_map.keys() if str(k) == str(from_bus_label)]
-                    if keys:
-                        from_idx = bus_map[keys[0]]
-                    else:
-                        debug(f"[WARN] line from_bus {from_bus_label} not found in bus_map; skipping")
-                        continue
-                else:
-                    from_idx = bus_map[from_bus_label]
-                if to_bus_label not in bus_map:
-                    keys = [k for k in bus_map.keys() if str(k) == str(to_bus_label)]
-                    if keys:
-                        to_idx = bus_map[keys[0]]
-                    else:
-                        debug(f"[WARN] line to_bus {to_bus_label} not found in bus_map; skipping")
-                        continue
-                else:
-                    to_idx = bus_map[to_bus_label]
-
-                length_m = safe_float(r.get("length_m", 50.0), 50.0)
-                length_km = max(0.001, length_m / 1000.0)
-                r_ohm_per_km = safe_float(r.get("r_ohm_per_km", r.get("r_ohm_per_km", 0.65)), 0.65)
-                x_ohm_per_km = safe_float(r.get("x_ohm_per_km", r.get("x_ohm_per_km", 0.412)), 0.412)
-                c_nf_per_km = safe_float(r.get("c_nf_per_km", 0.0), 0.0)
-                max_i_ka = safe_float(r.get("max_i_ka", 0.2), 0.2)
-                pp.create_line_from_parameters(net, from_bus=from_idx, to_bus=to_idx,
-                                               length_km=length_km,
-                                               r_ohm_per_km=r_ohm_per_km,
-                                               x_ohm_per_km=x_ohm_per_km,
-                                               c_nf_per_km=c_nf_per_km,
-                                               max_i_ka=max_i_ka,
-                                               name=str(r.get("line_id", f"line_{from_idx}_{to_idx}")))
-            except Exception as e:
-                debug(f"[WARN] cannot create line row {_}: {e}")
-
-    # Loads from load_timeseries sheet (we'll aggregate per bus/phase mean or sum)
-    load_ts = sheets.get("load_timeseries")
-    if load_ts is not None and not load_ts.empty:
-        # aggregate by bus and phase summing P_kw
-        try:
-            # ensure column names standardized
-            load_ts = load_ts.rename(columns={c: c.strip() for c in load_ts.columns})
-            grouped = load_ts.groupby(["bus", "phase"], dropna=True).agg({"p_kw": "mean", "q_kvar": "mean"}).reset_index()
-            for _, r in grouped.iterrows():
-                bus_label = r["bus"]
-                if bus_label not in bus_map:
-                    debug(f"[WARN] load bus {bus_label} not in bus_map -> skipping load")
-                    continue
-                p_mw = safe_float(r["p_kw"], 0.0) / 1000.0
-                q_mvar = safe_float(r["q_kvar"], 0.0) / 1000.0
-                if p_mw > 0 or q_mvar > 0:
-                    pp.create_load(net, bus=bus_map[bus_label], p_mw=p_mw, q_mvar=q_mvar, name=f"Load_{bus_label}")
+            idx = pp.create_bus(net, vn_kv=float(b.get("vn_kv", 0.4)), name=str(b["bus"]))
+            bus_map[str(b["bus"])] = idx
+            if int(b.get("is_slack", 0)) == 1:
+                pp.create_ext_grid(net, bus=idx, vm_pu=1.0, name="Slack")
         except Exception as e:
-            debug(f"[WARN] error processing load_timeseries: {e}")
+            debug(f"[WARN] erreur création bus {b}: {e}")
 
-    else:
-        # fallback: try to use data_phase sheet 'P (W)' columns
-        data_phase = sheets.get("data_phase")
-        if data_phase is not None:
-            # try to pick P (W), Unnamed: 2, Unnamed: 3 as earlier
-            for _, r in data_phase.iterrows():
-                dep = r.get("Départ")
-                if dep is None or pd.isna(dep):
-                    continue
-                # map dep to bus label (if buses are labels like B1..)
-                # assume departure value equals bus label in buses sheet or index
-                bus_label = None
-                # first try exact match
-                if dep in bus_map:
-                    bus_label = dep
-                else:
-                    # try "B{dep}" match
-                    key = f"B{int(dep)}" if not pd.isna(dep) else None
-                    if key in bus_map:
-                        bus_label = key
-                if bus_label is None:
-                    # try first bus
-                    bus_idx = list(bus_map.values())[0]
-                else:
-                    bus_idx = bus_map[bus_label]
-                P_w = 0.0
-                for colname in ["P (W)", "Unnamed: 2", "Unnamed: 3"]:
-                    P_w += safe_float(r.get(colname, 0.0), 0.0)
-                p_mw = max(0.0, P_w) / 1e6
-                if p_mw > 0:
-                    pp.create_load(net, bus=bus_idx, p_mw=p_mw, q_mvar=0.0, name=f"Load_dep_{dep}")
-
-    # PV static sheet
-    pv_static = sheets.get("pv_static")
-    pv_map = {}
-    if pv_static is not None and not pv_static.empty:
-        for _, r in pv_static.iterrows():
-            bus_label = r.get("bus")
-            if bus_label not in bus_map:
-                debug(f"[WARN] pv bus {bus_label} not in bus_map; skipping PV")
+    # lines
+    lines_created = 0
+    for l in line:
+        try:
+            fb = bus_map.get(l["from_bus"]); tb = bus_map.get(l["to_bus"])
+            if fb is None or tb is None:
+                debug(f"[WARN] ligne {l['line_id']} -> bus introuvable (from={l['from_bus']} to={l['to_bus']}). Skip.")
                 continue
-            p_kw = safe_float(r.get("p_stc_kw", 0.0), 0.0)
-            q_kvar = safe_float(r.get("q_kvar", 0.0), 0.0) if "q_kvar" in r.index else 0.0
-            s_max_kva = safe_float(r.get("s_max_kva", r.get("s_max_kva", p_kw*1.1)), p_kw*1.1)
-            if p_kw > 0:
-                try:
-                    pp.create_sgen(net, bus=bus_map[bus_label], p_mw=p_kw/1000.0, q_mvar=q_kvar/1000.0,
-                                   name=str(r.get("pv_id", f"PV_{bus_label}")))
-                    pv_map[bus_map[bus_label]] = pv_map.get(bus_map[bus_label], 0.0) + p_kw
-                except Exception as e:
-                    debug(f"[WARN] create_sgen failed: {e}")
+            pp.create_line_from_parameters(net,
+                                           from_bus=fb, to_bus=tb,
+                                           length_km=float(l.get("length_m", 100))/1000.0,
+                                           r_ohm_per_km=float(l.get("r_ohm_per_km", 0.65)),
+                                           x_ohm_per_km=float(l.get("x_ohm_per_km", 0.412)),
+                                           c_nf_per_km=0.0, max_i_ka=0.2,
+                                           name=str(l.get("line_id")))
+            lines_created += 1
+        except Exception as e:
+            debug(f"[WARN] impossible de créer la ligne {l.get('line_id')}: {e}")
+    debug(f"Created {lines_created} lines.")
 
-    # ESS sheet: create storages (note: pandapower storage usage may require external controllers)
-    ess_df = sheets.get("ess")
-    ess_map = {}
-    if ess_df is not None and not ess_df.empty:
-        for _, r in ess_df.iterrows():
-            bus_label = r.get("bus")
+    # static PV
+    pv_map: Dict[int, float] = {}
+    pv_created = 0
+    for p in pv_static:
+        try:
+            bus_label = str(p["bus"])
             if bus_label not in bus_map:
-                debug(f"[WARN] ESS bus {bus_label} not in bus_map; skipping ESS creation")
+                debug(f"[WARN] PV {p['pv_id']} -> bus {bus_label} introuvable. Skip.")
                 continue
-            e_cap_kwh = safe_float(r.get("e_cap_kwh", ESS_CAP_kWh_DEFAULT), ESS_CAP_kWh_DEFAULT)
-            p_max_kw = safe_float(r.get("p_max_kw_per_phase", ESS_Pmax_kW_DEFAULT), ESS_Pmax_kW_DEFAULT)
+            p_kw = safe_float(p.get("p_stc_kw", 0.0))
+            pp.create_sgen(net, bus=bus_map[bus_label], p_mw=p_kw/1000.0, q_mvar=0.0, name=p["pv_id"])
+            pv_map[bus_map[bus_label]] = pv_map.get(bus_map[bus_label], 0.0) + p_kw
+            pv_created += 1
+        except Exception as e:
+            debug(f"[WARN] create_sgen failed: {e}")
+    debug(f"Created {pv_created} PV modules.")
+
+    # create loads from load_timeseries aggregated (mean per bus)
+    load_df = pd.DataFrame(load_timeseries)
+    if not load_df.empty:
+        grouped = load_df.groupby("bus").agg({"p_kw":"mean","q_kvar":"mean"}).reset_index()
+        created_loads = 0
+        for _, r in grouped.iterrows():
+            bus_label = str(r["bus"])
+            if bus_label not in bus_map:
+                debug(f"[WARN] Load bus {bus_label} not found -> skip")
+                continue
+            p_mw = float(r["p_kw"])/1000.0
+            q_mvar = float(r["q_kvar"])/1000.0
             try:
-                pp.create_storage(net, bus=bus_map[bus_label],
-                                  p_mw=0.0,
-                                  max_e_mwh=max(0.0, e_cap_kwh/1000.0),
-                                  sn_mva=max(0.0, p_max_kw/1000.0),
-                                  controllable=True,
-                                  name=str(r.get("ess_id", f"ESS_{bus_label}")))
-                ess_map[bus_map[bus_label]] = {"cap_kwh": e_cap_kwh, "pmax_kw": p_max_kw}
+                pp.create_load(net, bus=bus_map[bus_label], p_mw=p_mw, q_mvar=q_mvar, name=f"Load_{bus_label}")
+                created_loads += 1
             except Exception as e:
-                debug(f"[WARN] create_storage failed: {e}")
+                debug(f"[WARN] create_load failed: {e}")
+        debug(f"Created {created_loads} loads from load_timeseries.")
+
+    # storages (ESS)
+    ess_map: Dict[int, Dict[str, float]] = {}
+    ess_created = 0
+    for s in ess:
+        try:
+            bus_label = str(s["bus"])
+            if bus_label not in bus_map:
+                debug(f"[WARN] ESS {s['ess_id']} -> bus {bus_label} introuvable. Skip.")
+                continue
+            cap_kwh = safe_float(s.get("e_cap_kwh", 20.0))
+            pmax_kw = safe_float(s.get("p_max_kw_per_phase", 4.0))
+            pp.create_storage(net, bus=bus_map[bus_label], p_mw=0.0,
+                              max_e_mwh=cap_kwh/1000.0, sn_mva=pmax_kw/1000.0,
+                              controllable=True, name=s["ess_id"])
+            ess_map[bus_map[bus_label]] = {"cap_kwh":cap_kwh, "pmax_kw":pmax_kw, "id": s["ess_id"]}
+            ess_created += 1
+        except Exception as e:
+            debug(f"[WARN] create_storage failed: {e}")
+    debug(f"Created {ess_created} ESS entries (pandapower storages).")
 
     return net, bus_map, pv_map, ess_map
 
-# -----------------------
-# Powerflow run with robustness
-# -----------------------
-def run_pf_robust(net):
+# ---------------------------
+# Powerflow runner & helpers
+# ---------------------------
+def run_powerflow_for_timestep(net, bus_map, pv_scale=1.0, timestep:str=None, verbose=False):
     """
-    Execute runpp with a few fallback strategies on failure (nr, enforce_q_lims, calculate_voltage_angles).
+    Met à jour sgens et loads si possible pour le timestep (si time series fournie),
+    execute runpp (robuste), et retourne résultats agrégés par bus:
+      DataFrame with columns: ['t','bus_label','bus_idx','V_pu','P_loss_kW_total_line_share']
     """
+    if pp is None:
+        # produce synthetic outputs (fallback) - flat voltages 1.0, zero losses
+        rows=[]
+        for label, idx in bus_map.items():
+            rows.append({"t":timestep, "Départ": label, "bus_idx": idx, "V_pu": 1.0, "P_loss_kW": 0.0})
+        return pd.DataFrame(rows)
+
+    # Try to apply pv_timeseries and load_timeseries for given timestep (if matches)
+    # Update sgen: scale static PV by pv_scale and override if pv_timeseries exists
+    try:
+        # scale static sgens uniformly by pv_scale: multiply existing p_mw in net.sgen by scale
+        if "sgen" in net and not net.sgen.empty:
+            for idx in net.sgen.index:
+                original = float(net.sgen.at[idx,"p_mw"])
+                net.sgen.at[idx,"p_mw"] = original * pv_scale
+        # override from pv_timeseries if present for specific pv_id
+        pv_ts_df = pd.DataFrame(pv_timeseries)
+        if timestep is not None and not pv_ts_df.empty:
+            # find entries matching timestep
+            rows = pv_ts_df[pv_ts_df["time"]==timestep]
+            # for each entry, find sgen with same name/pv_id and set p_mw
+            for _, r in rows.iterrows():
+                pv_id = str(r["pv_id"])
+                p_kw = safe_float(r["p_kw"], 0.0)
+                # find sgen row in net.sgen with name pv_id
+                if "sgen" in net and not net.sgen.empty:
+                    matches = net.sgen[net.sgen["name"]==pv_id]
+                    for i in matches.index:
+                        net.sgen.at[i,"p_mw"] = p_kw/1000.0
+    except Exception as e:
+        debug(f"[WARN] erreur mise à jour PV pour timestep {timestep}: {e}")
+
+    # Update loads for timestep if available
+    try:
+        load_ts_df = pd.DataFrame(load_timeseries)
+        if timestep is not None and not load_ts_df.empty:
+            rows = load_ts_df[load_ts_df["time"]==timestep]
+            # we approximate by setting aggregate load at bus to sum p_kw for that time
+            if not rows.empty:
+                # set all loads at bus to new value (note: pandapower may have multiple loads)
+                for _, r in rows.iterrows():
+                    bus_label = str(r["bus"])
+                    p_kw = safe_float(r["p_kw"], 0.0)
+                    # find loads for that bus and update p_mw
+                    if "load" in net and not net.load.empty:
+                        bus_idx = None
+                        if bus_label in net.bus["name"].values:
+                            bus_idx = net.bus[net.bus["name"]==bus_label].index[0]
+                        else:
+                            # try our bus_map mapping
+                            bus_idx = bus_map.get(bus_label)
+                        if bus_idx is not None:
+                            idxs = net.load[net.load["bus"]==bus_idx].index
+                            for i in idxs:
+                                net.load.at[i,"p_mw"] = p_kw/1000.0
+    except Exception as e:
+        debug(f"[WARN] erreur mise à jour charges pour timestep {timestep}: {e}")
+
+    # run powerflow with fallbacks
+    success = False
     try:
         pp.runpp(net)
-        return True
+        success = True
     except Exception as e:
-        debug(f"[WARN] runpp failed (default): {e}")
-    # try Newton-Raphson
-    try:
-        pp.runpp(net, algorithm="nr")
-        return True
-    except Exception as e:
-        debug(f"[WARN] runpp algorithm='nr' failed: {e}")
-    # try enforce Q limits
-    try:
-        pp.runpp(net, enforce_q_lims=True)
-        return True
-    except Exception as e:
-        debug(f"[WARN] runpp enforce_q_lims failed: {e}")
-    # try with voltage angles calculation
-    try:
-        pp.runpp(net, calculate_voltage_angles=True)
-        return True
-    except Exception as e:
-        debug(f"[ERROR] runpp failed finally: {e}")
-        return False
+        debug(f"[WARN] runpp standard failed: {e}")
+    if not success:
+        try:
+            pp.runpp(net, algorithm="nr")
+            success = True
+        except Exception as e:
+            debug(f"[WARN] runpp nr failed: {e}")
+    if not success:
+        try:
+            pp.runpp(net, enforce_q_lims=True)
+            success = True
+        except Exception as e:
+            debug(f"[WARN] runpp enforce_q_lims failed: {e}")
+    if not success:
+        debug(f"[ERROR] Powerflow impossible pour timestep {timestep} (on continuera).")
 
-# -----------------------
-# Collect results
-# -----------------------
-def collect_results(net, bus_map) -> pd.DataFrame:
-    """
-    Collect Vm_pu per bus and losses per line -> DataFrame with columns (Départ, bus_idx, V_pu, P_loss_kW)
-    """
-    # vm_pu
-    vm_series = {}
-    if hasattr(net, "res_bus") and "vm_pu" in net.res_bus:
-        for idx, v in net.res_bus["vm_pu"].items():
-            vm_series[int(idx)] = float(v)
-    else:
-        # fallback default
-        for b in bus_map.values():
-            vm_series[b] = 1.0
-
-    # losses
-    losses_per_bus = {b: 0.0 for b in bus_map.values()}
-    if hasattr(net, "res_line") and "pl_mw" in net.res_line:
-        for idx, row in net.line.iterrows():
-            pl_mw = float(net.res_line.loc[idx, "pl_mw"]) if idx in net.res_line.index else 0.0
-            loss_kw = pl_mw * 1000.0
-            # distribute evenly
-            fbus = int(row["from_bus"]); tbus = int(row["to_bus"])
-            losses_per_bus[fbus] = losses_per_bus.get(fbus, 0.0) + loss_kw/2.0
-            losses_per_bus[tbus] = losses_per_bus.get(tbus, 0.0) + loss_kw/2.0
-
+    # collect results
     rows = []
-    # reverse map bus index -> departure key
-    bus_to_dep = {bus_idx: dep for dep, bus_idx in bus_map.items()}
-    for bus_idx, dep in bus_to_dep.items():
-        rows.append({
-            "Départ": dep,
-            "bus_idx": int(bus_idx),
-            "V_pu": vm_series.get(bus_idx, 1.0),
-            "P_loss_kW": losses_per_bus.get(bus_idx, 0.0)
-        })
-    df = pd.DataFrame(rows)
-    return df
+    # compute line losses total pl_mw per line -> distribute half to each end (approx)
+    total_line_losses_kw = 0.0
+    if hasattr(net, "res_line") and not net.res_line.empty:
+        for idx in net.res_line.index:
+            pl_mw = safe_float(net.res_line.at[idx, "pl_mw"], 0.0)
+            total_line_losses_kw += pl_mw * 1000.0
 
-# -----------------------
-# Visualizations (many types)
-# -----------------------
-def plot_line_voltage_by_scenario(df_all: pd.DataFrame, name="voltage_by_scenario"):
+    # get bus voltage magnitudes
+    for label, idx in bus_map.items():
+        V_pu = 1.0
+        if hasattr(net, "res_bus") and "vm_pu" in net.res_bus.columns:
+            if idx in net.res_bus.index:
+                V_pu = float(net.res_bus.at[idx, "vm_pu"])
+        # approximate loss share per bus (equal share of total_line_losses_kw / nb_buses)
+        P_loss_share = float(total_line_losses_kw) / max(1, len(bus_map))
+        rows.append({"t":timestep, "Départ": label, "bus_idx": idx, "V_pu": V_pu, "P_loss_kW": P_loss_share})
+    return pd.DataFrame(rows)
+
+# ---------------------------
+# Run scenarios (PV scales + ESS)
+# ---------------------------
+def run_all_scenarios(pv_scales = [0.0, 0.2, 0.5], include_ess=False):
+    """
+    Pour chaque scenario PV scale, pour chaque timestep, exécute PF et collecte résultats.
+    Retour: DataFrame results_all columns: ['Scenario','t','Départ','bus_idx','V_pu','P_loss_kW']
+    """
+    net_base, bus_map, pv_map, ess_map = build_network_from_dicts()
+    results_list = []
+    # if pandapower missing, build_network returns None net; our run function will handle fallback
+    for scale in pv_scales:
+        scen_name = f"PV_{int(scale*100)}%"
+        debug(f"Running scenario {scen_name} ...")
+        # deep copy network safely (use python copy)
+        if net_base is None:
+            net_for_scenario = None
+        else:
+            net_for_scenario = copy.deepcopy(net_base)
+        for t in SimulationSettings["timesteps"]:
+            try:
+                df = run_powerflow_for_timestep(net_for_scenario, bus_map, pv_scale=scale, timestep=t)
+                df["Scenario"] = scen_name
+                df["t"] = t
+                results_list.append(df)
+            except Exception as e:
+                debug(f"[ERROR] scenario {scen_name} timestep {t} failed: {e}")
+                traceback.print_exc()
+    # if include_ess -> we will append PV_x%_ESS scenarios (post-hoc; ESS effect applied later)
+    results_all = pd.concat(results_list, ignore_index=True) if results_list else pd.DataFrame(columns=["Scenario","t","Départ","bus_idx","V_pu","P_loss_kW"])
+    if include_ess:
+        # we'll copy PV_50% and mark ESS present (effect applied later after optimization)
+        ess_scen = []
+        for t in SimulationSettings["timesteps"]:
+            subset = results_all[(results_all["Scenario"]==f"PV_{int(50)}%") & (results_all["t"]==t)].copy()
+            if not subset.empty:
+                subset["Scenario"] = f"PV_{int(50)}%_ESS"
+                ess_scen.append(subset)
+        if ess_scen:
+            results_all = pd.concat([results_all] + ess_scen, ignore_index=True)
+    return results_all, bus_map, pv_map, ess_map
+
+# ---------------------------
+# Summarize & metrics
+# ---------------------------
+def summarize_by_scenario(results_all: pd.DataFrame):
+    # compute per scenario summary: avg V, total losses, avg VUF (not provided -> 0)
+    rows=[]
+    for scen in results_all["Scenario"].unique():
+        df = results_all[results_all["Scenario"]==scen]
+        rows.append({
+            "Scenario": scen,
+            "V_mean": float(df["V_pu"].mean()) if not df.empty else np.nan,
+            "P_loss_kW_total": float(df["P_loss_kW"].sum()) if not df.empty else 0.0,
+            "VUF_mean_percent": 0.0
+        })
+    return pd.DataFrame(rows)
+
+def compute_gains(summary_df: pd.DataFrame):
+    # baseline = PV_0%
+    base = summary_df[summary_df["Scenario"]=="PV_0%"]
+    if base.empty:
+        baseline_V = summary_df["V_mean"].mean()
+        baseline_loss = summary_df["P_loss_kW_total"].mean()
+    else:
+        baseline_V = base["V_mean"].iloc[0]
+        baseline_loss = base["P_loss_kW_total"].iloc[0]
+    rows=[]
+    for _, r in summary_df.iterrows():
+        gain_loss = 100.0 * (baseline_loss - r["P_loss_kW_total"]) / max(abs(baseline_loss), 1e-9)
+        gain_v = 100.0 * (r["V_mean"] - baseline_V) / max(abs(baseline_V), 1e-9) if baseline_V!=0 else 0.0
+        rows.append({"Scenario": r["Scenario"], "ΔPertes_%": gain_loss, "ΔTension_%": gain_v, "V_mean": r["V_mean"], "P_loss_kW_total": r["P_loss_kW_total"]})
+    return pd.DataFrame(rows)
+
+# ---------------------------
+# ESS optimisation (Pyomo multi-periode proxy)
+# ---------------------------
+def optimize_ess_pyomo(results_all: pd.DataFrame, bus_map: Dict[str,int], ess_map:Dict[int,Dict[str,float]]):
+    """
+    Optimisation multi-periode: variables P_dis, P_ch et SOC par bus/t.
+    Proxy linking: V_after = V_before + k_V_per_kW * Pess (Pess in kW, positive = discharge)
+    Losses after eaten by ESS approximated by loss_after = loss_before - k_loss_per_kW * Pess_total
+    Objective = weighted sum from SimulationSettings["weights"] combining voltage deviation and losses.
+    """
+    if pyo is None:
+        raise ImportError(f"Pyomo non installé: {_pyo_err}")
+    # Check solver GLPK
+    solver = pyo.SolverFactory("glpk")
+    if not solver.available():
+        raise RuntimeError("GLPK solver non disponible. Installe GLPK pour utiliser l'optimiseur Pyomo.")
+    # prepare data: baseline V and losses per bus per timestep from results_all (PV_50%)
+    target_scen = "PV_50%"
+    df_target = results_all[results_all["Scenario"]==target_scen]
+    if df_target.empty:
+        raise ValueError(f"Aucun résultat pour le scénario {target_scen} — impossible d'optimiser.")
+    timesteps = sorted(df_target["t"].unique())
+    buses_labels = sorted(bus_map.keys())
+    # map bus label -> baseline V mean per timestep
+    V0 = {(b,t): 1.0 for b in buses_labels for t in timesteps}
+    Loss0 = {(b,t): 0.0 for b in buses_labels for t in timesteps}
+    for _, r in df_target.iterrows():
+        b = r["Départ"]; t = r["t"]
+        V0[(b,t)] = float(r["V_pu"])
+        Loss0[(b,t)] = float(r["P_loss_kW"])
+    # build model
+    model = pyo.ConcreteModel()
+    model.B = pyo.Set(initialize=buses_labels, ordered=True)
+    model.T = pyo.Set(initialize=timesteps, ordered=True)
+    # Pdis (kW), Pchg (kW), SOC (kWh)
+    def pdis_index(m):
+        return ((b,t) for b in model.B for t in model.T)
+    model.Pdis = pyo.Var(model.B, model.T, domain=pyo.Reals, bounds=lambda m,b,t: (-ess_map.get(bus_map.get(b, -999), {}).get("pmax_kw", 0)*1.0, ess_map.get(bus_map.get(b, -999), {}).get("pmax_kw", 0)*1.0))  # positive discharge
+    model.SOC = pyo.Var(model.B, model.T, domain=pyo.NonNegativeReals, bounds=(0, max((v.get("cap_kwh",20) for v in ess_map.values()), default=20)))
+    # Some ESS may not exist at certain buses; enforce zero bounds as needed
+    # initial SOC as half capacity or as provided
+    # SOC dynamics
+    EFF_CH = 0.94; EFF_DIS = 0.94
+    cap_by_bus = {b: ess_map.get(bus_map[b], {}).get("cap_kwh", 0.0) for b in buses_labels}
+    pmax_by_bus = {b: ess_map.get(bus_map[b], {}).get("pmax_kw", 0.0) for b in buses_labels}
+
+    # override Pdis bounds for buses without ESS (force 0)
+    for b in buses_labels:
+        if pmax_by_bus[b] <= 0:
+            # create constraint that Pdis[b,t] == 0
+            pass
+
+    # constraints SOC dynamics
+    def soc_rule(m, b, t):
+        # if no ESS: SOC fixed 0
+        cap = cap_by_bus[b]
+        if cap <= 0:
+            return m.SOC[b,t] == 0.0
+        t_list = list(model.T)
+        if t == t_list[0]:
+            # init to soc_init ~ 50% of cap
+            return m.SOC[b,t] == cap * 0.5 + 0.0
+        else:
+            prev = t_list[t_list.index(t)-1]
+            # SOC_t = SOC_{t-1} - Pdis(t)/EFF_DIS * dt + Pch*EFF_CH*dt
+            # But we only model Pdis (net positive = discharge). For simplicity, treat Pdis positive=>discharge reduces SOC.
+            return m.SOC[b,t] == m.SOC[b,prev] - (m.Pdis[b,t] / EFF_DIS) * 1.0  # dt=1h, Pdis in kW, SOC in kWh
+    model.soc_cons = pyo.Constraint(model.B, model.T, rule=soc_rule)
+
+    # bound Pdis to pmax
+    def pdis_bounds_rule(m, b, t):
+        return (-pmax_by_bus[b], pmax_by_bus[b])
+    # Note: pyomo Var bounds via domain already used; create explicit constraint if needed
+    # Objective: weights on voltage deviation and losses
+    kV = SimulationSettings["k_V_per_kW"]
+    k_loss = SimulationSettings["k_loss_per_kW"]
+    w = SimulationSettings["weights"]
+
+    def obj_rule(m):
+        expr = 0.0
+        for b in buses_labels:
+            for t in timesteps:
+                V_before = V0[(b,t)]
+                Pess = m.Pdis[b,t]  # positive discharge increases local V
+                V_after = V_before + kV * Pess
+                loss_before = Loss0[(b,t)]
+                loss_after = pyo.maximize(loss_before - k_loss * Pess, 0) if False else (loss_before - k_loss * Pess)
+                # penalize voltage deviation from 1.0 (squared) and losses
+                expr += w["w1"] * (V_after - 1.0)**2 + w["w2"] * (loss_after) + w["w3"] * (Pess**2)
+        return expr
+    model.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    # solve
+    debug("Lancement solveur GLPK (Pyomo) pour optimisation ESS (proxy)...")
+    res = solver.solve(model, tee=False)
+    debug(f"Pyomo solve status: {res.solver.status}, termination: {res.solver.termination_condition}")
+
+    # extract schedule
+    rows=[]
+    for b in buses_labels:
+        for t in timesteps:
+            try:
+                p_ess = float(pyo.value(model.Pdis[b,t]))
+                soc = float(pyo.value(model.SOC[b,t]))
+            except Exception:
+                p_ess = 0.0; soc = 0.0
+            rows.append({"Départ": b, "t": t, "P_ESS_kW_opt": p_ess, "SOC_kWh_opt": soc, "SOC_%_opt": (soc / max(1e-6, cap_by_bus[b]))*100.0 if cap_by_bus[b]>0 else 0.0})
+    df_opt = pd.DataFrame(rows)
+    csv_out = os.path.join(OUTPUT_DIR, "summary_ess_pyomo.csv")
+    df_opt.to_csv(csv_out, index=False)
+    debug(f"Pyomo optimisation results saved -> {csv_out}")
+    return df_opt
+
+# ---------------------------
+# ESS heuristic fallback
+# ---------------------------
+def heuristic_ess_schedule(results_all: pd.DataFrame, bus_map:Dict[str,int], ess_map:Dict[int,Dict[str,float]]):
+    """
+    Simple heuristic: charge when V high, discharge when V low.
+    Return DataFrame similar to optimize_ess_pyomo output.
+    """
+    df_base = results_all[results_all["Scenario"]=="PV_50%"].copy()
+    if df_base.empty:
+        df_base = results_all.groupby(["t","Départ"]).mean().reset_index()
+    rows=[]
+    for (t, group) in df_base.groupby("t"):
+        for _, r in group.iterrows():
+            b = r["Départ"]
+            V = float(r["V_pu"])
+            cap = ess_map.get(bus_map.get(b,-1),{}).get("cap_kwh", 0.0)
+            pmax = ess_map.get(bus_map.get(b,-1),{}).get("pmax_kw", 0.0)
+            if cap <= 0 or pmax <=0:
+                rows.append({"Départ": b, "t": t, "P_ESS_kW_heur": 0.0, "SOC_kWh_heur": 0.0, "SOC_%_heur": 0.0})
+                continue
+            # if V < 0.98 -> discharge, if V >1.02 -> charge (negative power)
+            if V < 0.98:
+                p = min(pmax, cap*0.2)   # discharge modest amount
+                soc = max(0.0, cap*0.5 - p)
+            elif V > 1.02:
+                p = -min(pmax, cap*0.2)  # charge negative
+                soc = min(cap, cap*0.5 + abs(p))
+            else:
+                p = 0.0; soc = cap*0.5
+            rows.append({"Départ": b, "t": t, "P_ESS_kW_heur": p, "SOC_kWh_heur": soc, "SOC_%_heur": (soc/cap)*100.0 if cap>0 else 0.0})
+    dfh = pd.DataFrame(rows)
+    out = os.path.join(OUTPUT_DIR, "summary_ess_heuristic.csv")
+    dfh.to_csv(out, index=False)
+    debug(f"Heuristic ESS schedule saved -> {out}")
+    return dfh
+
+# ---------------------------
+# Apply ESS proxy (voltage correction & loss correction)
+# ---------------------------
+def apply_ess_effects(results_all: pd.DataFrame, df_ess_schedule: pd.DataFrame, mode:str="opt"):
+    """
+    Adds columns: P_ESS_kW, SOC_kWh, V_pu_after, P_loss_kW_after
+    mode: 'opt' expects columns P_ESS_kW_opt, 'heur' expects P_ESS_kW_heur
+    """
+    kV = SimulationSettings["k_V_per_kW"]
+    k_loss = SimulationSettings["k_loss_per_kW"]
+    df = results_all.copy()
+    # merge schedules
+    keycols = ["Départ","t"]
+    if mode=="opt":
+        schedule = df_ess_schedule.rename(columns={"P_ESS_kW_opt":"P_ESS_kW","SOC_kWh_opt":"SOC_kWh","SOC_%_opt":"SOC_%"})
+    else:
+        schedule = df_ess_schedule.rename(columns={"P_ESS_kW_heur":"P_ESS_kW","SOC_kWh_heur":"SOC_kWh","SOC_%_heur":"SOC_%"})
+    merged = pd.merge(df, schedule[keycols+["P_ESS_kW","SOC_kWh","SOC_%"]], on=keycols, how="left")
+    merged["P_ESS_kW"] = merged["P_ESS_kW"].fillna(0.0)
+    merged["SOC_kWh"] = merged["SOC_kWh"].fillna(0.0)
+    merged["SOC_%"] = merged["SOC_%"].fillna(0.0)
+    merged["V_pu_after"] = merged["V_pu"] + kV * merged["P_ESS_kW"]
+    merged["P_loss_kW_after"] = merged["P_loss_kW"] - k_loss * merged["P_ESS_kW"]
+    merged["P_loss_kW_after"] = merged["P_loss_kW_after"].clip(lower=0.0)
+    return merged
+
+# ---------------------------
+# Plotting functions (14 figures)
+# ---------------------------
+def save_fig(fig, name):
+    path = os.path.join(OUTPUT_DIR, f"{name}.png")
+    try:
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        debug(f"Saved figure -> {path}")
+    except Exception as e:
+        debug(f"[WARN] cannot save figure {name}: {e}")
+
+def plot_voltage_profile_by_scenario(results_df):
     fig, ax = plt.subplots(figsize=(10,5))
-    sns.lineplot(data=df_all, x="Départ", y="V_pu", hue="Scenario", marker="o", ax=ax)
+    sns.lineplot(data=results_df, x="Départ", y="V_pu", hue="Scenario", marker="o", ax=ax)
     ax.axhline(1.05, color="red", linestyle="--", label="Vmax")
     ax.axhline(0.95, color="red", linestyle="--", label="Vmin")
     ax.set_title("Profil de tension par scénario")
-    ax.set_ylabel("V (pu)")
+    ax.set_ylabel("Tension (pu)")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    if SAVE_FIGURES: save_fig(fig, name)
+    save_fig(fig, "voltage_profile_by_scenario")
     plt.show()
 
-def plot_bar_losses(df_all: pd.DataFrame, name="losses_bar"):
+def plot_losses_by_scenario(results_df):
+    # aggregate per scenario & departure
+    agg = results_df.groupby(["Scenario","Départ"]).P_loss_kW.mean().reset_index()
     fig, ax = plt.subplots(figsize=(10,5))
-    sns.barplot(data=df_all, x="Départ", y="P_loss_kW", hue="Scenario", ax=ax)
+    sns.barplot(data=agg, x="Départ", y="P_loss_kW", hue="Scenario", ax=ax)
     ax.set_title("Pertes actives par scénario")
     ax.set_ylabel("P pertes (kW)")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    if SAVE_FIGURES: save_fig(fig, name)
+    save_fig(fig, "losses_by_scenario")
     plt.show()
 
-def plot_heatmap_voltage(df_all: pd.DataFrame, name="voltage_heatmap"):
+def plot_voltage_heatmap(results_df):
     try:
-        pivot = df_all.pivot(index="Scenario", columns="Départ", values="V_pu")
+        pivot = results_df.groupby(["Scenario","Départ"]).V_pu.mean().unstack(level=0).T
+        fig, ax = plt.subplots(figsize=(10,5))
+        sns.heatmap(pivot, annot=True, fmt=".3f", cmap="coolwarm", ax=ax, cbar_kws={"label":"V_pu"})
+        ax.set_title("Heatmap de la tension par scénario et départ")
+        plt.tight_layout()
+        save_fig(fig, "voltage_heatmap_by_scenario_depart")
+        plt.show()
     except Exception as e:
-        debug(f"[WARN] heatmap pivot failed: {e}")
-        return
-    fig, ax = plt.subplots(figsize=(10,5))
-    sns.heatmap(pivot, annot=True, fmt=".3f", cmap="coolwarm", cbar_kws={"label":"V_pu"}, ax=ax)
-    ax.set_title("Heatmap de la tension par scénario et départ")
-    plt.tight_layout()
-    if SAVE_FIGURES: save_fig(fig, name)
-    plt.show()
+        debug(f"[WARN] plot_voltage_heatmap failed: {e}")
 
-def plot_pv_capacity_by_depart(pv_map: Dict[int, float], bus_map: Dict[Any,int], name="pv_capacity"):
-    if not pv_map:
+def plot_pv_capacity_by_depart(pv_map, bus_map):
+    items = []
+    for bus_idx, kw in pv_map.items():
+        # find label
+        label = next((lbl for lbl, idx in bus_map.items() if idx==bus_idx), str(bus_idx))
+        items.append({"Départ": label, "PV_kW": kw})
+    if not items:
         debug("[INFO] no PV capacity to plot.")
         return
-    # invert bus_map to label by bus_idx
-    items = [{"bus_idx": k, "PV_kW": v, "label": next((str(dep) for dep,b in bus_map.items() if b==k), str(k))}
-             for k,v in pv_map.items()]
     dfpv = pd.DataFrame(items)
     fig, ax = plt.subplots(figsize=(8,4))
-    sns.barplot(data=dfpv, x="label", y="PV_kW", ax=ax, palette="crest")
+    sns.barplot(data=dfpv, x="Départ", y="PV_kW", ax=ax)
     ax.set_title("Capacité d'accueil PV par départ (kW)")
-    ax.set_xlabel("Départ")
-    ax.set_ylabel("PV (kW)")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    if SAVE_FIGURES: save_fig(fig, name)
+    save_fig(fig, "pv_capacity_by_depart")
     plt.show()
 
-def plot_comparative_gains(summary_df: pd.DataFrame, name="comparative_gains"):
-    if summary_df.empty:
-        debug("[INFO] no summary to plot comparative gains.")
+def plot_comparative_gains(gains_df):
+    if gains_df.empty:
+        debug("[INFO] no gains to plot.")
         return
-    melted = summary_df.melt(id_vars="Scenario", var_name="Metric", value_name="Gain_%")
+    melted = gains_df.melt(id_vars="Scenario", value_vars=["ΔPertes_%","ΔTension_%"], var_name="Metric", value_name="Gain_%")
     fig, ax = plt.subplots(figsize=(9,5))
     sns.barplot(data=melted, x="Metric", y="Gain_%", hue="Scenario", ax=ax)
-    ax.axhline(0, color="black", linewidth=1)
     ax.set_title("Comparaison des gains par scénario")
     plt.tight_layout()
-    if SAVE_FIGURES: save_fig(fig, name)
+    save_fig(fig, "comparative_gains")
     plt.show()
 
-def plot_gains_heatmap(summary_df: pd.DataFrame, name="gains_heatmap"):
-    if summary_df.empty:
-        return
-    pivot = summary_df.set_index("Scenario")
+def plot_gains_heatmap(gains_df):
+    if gains_df.empty: return
+    pivot = gains_df.set_index("Scenario")[["ΔPertes_%","ΔTension_%"]]
     fig, ax = plt.subplots(figsize=(6,4))
-    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0, ax=ax, cbar_kws={"label":"Gain (%)"})
+    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0, ax=ax)
     ax.set_title("Heatmap des gains par scénario et métrique")
     plt.tight_layout()
-    if SAVE_FIGURES: save_fig(fig, name)
+    save_fig(fig, "gains_heatmap")
     plt.show()
 
-def plot_radar_metrics(summary_df: pd.DataFrame, metrics=None, name="radar_metrics"):
-    if summary_df.empty:
+def plot_soc_and_pess(df_ess, mode="opt"):
+    col_p = "P_ESS_kW_opt" if "P_ESS_kW_opt" in df_ess.columns else ("P_ESS_kW_heur" if "P_ESS_kW_heur" in df_ess.columns else "P_ESS_kW")
+    col_s = "SOC_%_opt" if "SOC_%_opt" in df_ess.columns else ("SOC_%_heur" if "SOC_%_heur" in df_ess.columns else "SOC_%")
+    if col_s not in df_ess.columns or col_p not in df_ess.columns:
+        debug("[INFO] pas de schedule ESS pour plot SOC/PESS")
         return
-    if metrics is None:
-        metrics = [c for c in summary_df.columns if c != "Scenario"]
-    labels = metrics
-    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
-    # close the plot
-    angles += angles[:1]
-    fig = plt.figure(figsize=(6,6))
-    ax = fig.add_subplot(111, polar=True)
-    for _, r in summary_df.iterrows():
-        values = [float(r[m]) for m in metrics]
-        values += values[:1]
-        ax.plot(angles, values, label=r["Scenario"])
-        ax.fill(angles, values, alpha=0.15)
-    ax.set_thetagrids(np.degrees(angles[:-1]), labels)
-    ax.set_title("Radar: gains / metrics par scénario")
-    ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
-    if SAVE_FIGURES: save_fig(fig, name)
+    # SOC line
+    fig, ax = plt.subplots(figsize=(9,4))
+    sns.lineplot(data=df_ess, x="t", y=col_s, hue="Départ", marker="o", ax=ax)
+    ax.set_title("SOC ESS optimisé (%)" if mode=="opt" else "SOC ESS (heuristique)")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    save_fig(fig, "soc_ess_optimized" if mode=="opt" else "soc_ess_heuristic")
+    plt.show()
+    # Pess bar
+    fig, ax = plt.subplots(figsize=(9,4))
+    sns.barplot(data=df_ess, x="t", y=col_p, hue="Départ", ax=ax)
+    ax.set_title("Puissance ESS (kW) — positive = décharge")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    save_fig(fig, "pess_ess_optimized" if mode=="opt" else "pess_ess_heuristic")
     plt.show()
 
-def plot_3d_surface_voltage(df_all: pd.DataFrame, name="surface_voltage_3d"):
-    """
-    Build a surface: x = departure index, y = scenario index, z = V_pu
-    """
+def plot_before_after_losses_and_voltage(results_df_with_ess):
+    # grouped losses before/after
     try:
-        scenarios = df_all["Scenario"].unique().tolist()
-        departures = df_all["Départ"].unique().tolist()
+        df = results_df_with_ess.copy()
+        agg = df.groupby(["Scenario","Départ"]).agg({"P_loss_kW":"mean","P_loss_kW_after":"mean","V_pu":"mean","V_pu_after":"mean"}).reset_index()
+        # losses grouped bar
+        fig, ax = plt.subplots(figsize=(10,5))
+        x = np.arange(len(agg["Départ"].unique()))
+        sns.barplot(data=agg.melt(id_vars=["Scenario","Départ"], value_vars=["P_loss_kW","P_loss_kW_after"]), x="Départ", y="value", hue="variable", ax=ax)
+        ax.set_title("Pertes avant / après ESS (moyennes)")
+        ax.set_ylabel("P (kW)")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        save_fig(fig, "loss_before_after_ess")
+        plt.show()
+        # voltage before/after line
+        fig, ax = plt.subplots(figsize=(10,5))
+        for dep in agg["Départ"].unique():
+            sub = agg[agg["Départ"]==dep]
+            ax.plot(["before","after"], [sub["V_pu"].iloc[0], sub["V_pu_after"].iloc[0]], marker="o", label=str(dep))
+        ax.set_title("Comparaison des tensions avant/après ESS")
+        ax.set_ylabel("V (pu)")
+        ax.legend(bbox_to_anchor=(1.02,1.0))
+        plt.tight_layout()
+        save_fig(fig, "voltage_before_after_ess")
+        plt.show()
+    except Exception as e:
+        debug(f"[WARN] plot_before_after_losses_and_voltage failed: {e}")
+
+def plot_pv_capacity_phase_heatmap(pv_static_list, bus_map):
+    # build matrix departures x phase
+    rows=[]
+    for p in pv_static_list:
+        label = p["bus"]
+        rows.append({"Départ":label, "phase":p.get("phase","A"), "PV_kW": safe_float(p.get("p_stc_kw",0.0))})
+    if not rows:
+        debug("[INFO] no PV per phase to plot")
+        return
+    df = pd.DataFrame(rows)
+    pivot = df.pivot_table(index="phase", columns="Départ", values="PV_kW", aggfunc="sum").fillna(0.0)
+    fig, ax = plt.subplots(figsize=(8,4))
+    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="YlGnBu", ax=ax)
+    ax.set_title("Capacité PV par départ et par phase (kW)")
+    plt.tight_layout()
+    save_fig(fig, "pv_capacity_by_depart_phase_heatmap")
+    plt.show()
+
+def plot_radar_metrics(summary_df):
+    # metrics: V_mean, P_loss_kW_total, VUF (set to 0)
+    try:
+        df = summary_df.copy()
+        metrics = ["V_mean","P_loss_kW_total"]
+        labels = metrics
+        angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
+        angles += angles[:1]
+        fig = plt.figure(figsize=(6,6))
+        ax = fig.add_subplot(111, polar=True)
+        for _, r in df.iterrows():
+            vals = [r[m] for m in metrics]
+            vals += vals[:1]
+            ax.plot(angles, vals, label=r["Scenario"])
+            ax.fill(angles, vals, alpha=0.15)
+        ax.set_thetagrids(np.degrees(angles[:-1]), labels)
+        ax.set_title("Radar: métriques par scénario")
+        ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
+        save_fig(fig, "radar_metrics_by_scenario")
+        plt.show()
+    except Exception as e:
+        debug(f"[WARN] plot_radar_metrics failed: {e}")
+
+def plot_surface_3d(results_df):
+    try:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa
+        scenarios = list(sorted(results_df["Scenario"].unique()))
+        departures = list(sorted(results_df["Départ"].unique()))
         Z = np.zeros((len(scenarios), len(departures)))
         for i, scen in enumerate(scenarios):
-            row = df_all[df_all["Scenario"]==scen].set_index("Départ")
+            sub = results_df[results_df["Scenario"]==scen].groupby("Départ").V_pu.mean()
             for j, dep in enumerate(departures):
-                Z[i, j] = float(row.loc[dep, "V_pu"]) if dep in row.index else np.nan
-        X, Y = np.meshgrid(np.arange(len(departures)), np.arange(len(scenarios)))
+                Z[i,j] = sub.get(dep, np.nan)
+        X, Y = np.meshgrid(range(len(departures)), range(len(scenarios)))
         fig = plt.figure(figsize=(10,6))
         ax = fig.add_subplot(111, projection='3d')
-        surf = ax.plot_surface(X, Y, Z, cmap=cm.coolwarm, linewidth=0, antialiased=True)
-        ax.set_xticks(np.arange(len(departures))); ax.set_xticklabels(departures, rotation=45)
-        ax.set_yticks(np.arange(len(scenarios))); ax.set_yticklabels(scenarios)
+        surf = ax.plot_surface(X, Y, Z, cmap="coolwarm")
+        ax.set_xticks(range(len(departures))); ax.set_xticklabels(departures, rotation=45)
+        ax.set_yticks(range(len(scenarios))); ax.set_yticklabels(scenarios)
         ax.set_xlabel("Départ"); ax.set_ylabel("Scenario"); ax.set_zlabel("V_pu")
         fig.colorbar(surf, shrink=0.5, aspect=10)
-        ax.set_title("Surface 3D: tension (V_pu) par départ & scénario")
-        if SAVE_FIGURES: save_fig(fig, name)
+        save_fig(fig, "surface_3D_tension")
         plt.show()
     except Exception as e:
-        debug(f"[WARN] 3D surface plot failed: {e}")
+        debug(f"[WARN] plot_surface_3d failed: {e}")
 
-# -----------------------
-# Comparisons summary
-# -----------------------
-def summarize_gains(results_all: pd.DataFrame) -> pd.DataFrame:
-    base = results_all[results_all["Scenario"]=="PV_0%"]
-    if base.empty:
-        debug("[WARN] baseline PV_0% not found; using overall mean as baseline fallback.")
-        baseline_loss = results_all["P_loss_kW"].mean()
-        baseline_v = results_all["V_pu"].mean()
-    else:
-        baseline_loss = base["P_loss_kW"].mean()
-        baseline_v = base["V_pu"].mean()
-    rows = []
-    for scen in results_all["Scenario"].unique():
-        df = results_all[results_all["Scenario"]==scen]
-        loss_mean = df["P_loss_kW"].mean()
-        v_mean = df["V_pu"].mean()
-        gain_loss = 100.0 * (baseline_loss - loss_mean) / max(abs(baseline_loss), 1e-9)
-        gain_v = 100.0 * (v_mean - baseline_v) / max(abs(baseline_v), 1e-9)
-        rows.append({"Scenario": scen, "ΔPertes_%": gain_loss, "ΔTension_%": gain_v, "ΔVUF_%": 0.0})
-    return pd.DataFrame(rows)
-
-# -----------------------
-# Module2 - ESS optimisation (Pyomo)
-# -----------------------
-def run_ess_pyomo_opt(results_json: str, ess_cap_kwh=ESS_CAP_kWh_DEFAULT, ess_pmax_kw=ESS_Pmax_kW_DEFAULT) -> pd.DataFrame:
-    if pyo is None:
-        raise ImportError(f"Pyomo not installed: {_pyo_err}")
-    # simple solver check GLPK
-    solver = pyo.SolverFactory("glpk")
-    if not solver.available():
-        raise RuntimeError("GLPK solver not available in PATH. Install GLPK to use Pyomo optimisation.")
-    # load results
-    df_all = pd.read_json(results_json)
-    target = f"PV_{int(PV_RATIO_DEFAULT*100)}%"
-    df = df_all[df_all["Scenario"]==target].reset_index(drop=True)
-    if df.empty:
-        raise ValueError(f"No scenario {target} found in results for Pyomo optimization.")
-    N = len(df)
-    model = pyo.ConcreteModel()
-    model.T = pyo.RangeSet(0, N-1)
-    model.P_ch = pyo.Var(model.T, domain=pyo.NonNegativeReals, bounds=(0, ess_pmax_kw))
-    model.P_dis = pyo.Var(model.T, domain=pyo.NonNegativeReals, bounds=(0, ess_pmax_kw))
-    model.SOC = pyo.Var(model.T, domain=pyo.NonNegativeReals, bounds=(0, ess_cap_kwh))
-    def p_ess_expr(m, t):
-        return m.P_dis[t] - m.P_ch[t]
-    model.P_ess = pyo.Expression(model.T, rule=p_ess_expr)
-    EFF_CH = 0.95; EFF_DIS = 0.95
-    def soc_balance(m, t):
-        if t == 0:
-            return m.SOC[t] == ess_cap_kwh/2.0
-        return m.SOC[t] == m.SOC[t-1] + EFF_CH * m.P_ch[t] - m.P_dis[t] / EFF_DIS
-    model.soc_con = pyo.Constraint(model.T, rule=soc_balance)
-    P_losses = df["P_loss_kW"].tolist()
-    def obj_rule(m):
-        # minimize losses - small reward for ESS usage (heuristic)
-        return sum(P_losses[t] for t in m.T) - 0.01 * sum(m.P_ess[t] for t in m.T)
-    model.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
-    # solve
-    debug("Running GLPK solver for ESS optimisation (Pyomo)...")
-    res = solver.solve(model, tee=False)
-    debug(f"GLPK status: {res.solver.status}, termination: {res.solver.termination_condition}")
-    P_ess = [pyo.value(model.P_ess[t]) for t in model.T]
-    SOC = [pyo.value(model.SOC[t]) for t in model.T]
-    df_out = df.copy()
-    df_out["P_ESS_kW_opt"] = P_ess
-    df_out["SOC_kWh_opt"] = SOC
-    df_out["SOC_%_opt"] = 100.0 * df_out["SOC_kWh_opt"] / ess_cap_kwh
-    df_out["P_loss_kW_afterESS_opt"] = np.maximum(df_out["P_loss_kW"] - 0.05 * df_out["P_ESS_kW_opt"], 0.0)
-    out_path = os.path.join(OUTPUT_DIR, "summary_ess_pyomo.csv")
-    df_out.to_csv(out_path, index=False)
-    debug(f"Pyomo optimisation results -> {out_path}")
-    return df_out
-
-# -----------------------
-# Module2 - ESS heuristic
-# -----------------------
-def run_ess_heuristic(results_json: str, ess_cap_kwh=ESS_CAP_kWh_DEFAULT, ess_pmax_kw=ESS_Pmax_kW_DEFAULT) -> pd.DataFrame:
-    df_all = pd.read_json(results_json)
-    target = f"PV_{int(PV_RATIO_DEFAULT*100)}%"
-    df = df_all[df_all["Scenario"]==target].reset_index(drop=True)
-    if df.empty:
-        raise ValueError(f"No scenario {target} found for heuristic ESS.")
-    V_LOW = 0.97; V_HIGH = 1.03; EFF = 0.95
-    soc = ess_cap_kwh/2.0
-    soc_list = []
-    p_ess_list = []
-    for _, r in df.iterrows():
-        v = float(r.get("V_pu", 1.0))
-        p_now = 0.0
-        if v < V_LOW and soc > 0:
-            p = min(ess_pmax_kw, soc)
-            p_now = p
-            soc -= p / EFF
-        elif v > V_HIGH and soc < ess_cap_kwh:
-            p = min(ess_pmax_kw, ess_cap_kwh - soc)
-            p_now = -p
-            soc += p * EFF
-        soc = max(0.0, min(ess_cap_kwh, soc))
-        soc_list.append(soc)
-        p_ess_list.append(p_now)
-    df_out = df.copy()
-    df_out["P_ESS_kW_heur"] = p_ess_list
-    df_out["SOC_kWh_heur"] = soc_list
-    df_out["SOC_%_heur"] = 100.0 * df_out["SOC_kWh_heur"] / ess_cap_kwh
-    df_out["P_loss_kW_afterESS_heur"] = np.maximum(df_out["P_loss_kW"] - 0.05 * df_out["P_ESS_kW_heur"], 0.0)
-    out_path = os.path.join(OUTPUT_DIR, "summary_ess_heuristic.csv")
-    df_out.to_csv(out_path, index=False)
-    debug(f"Heuristic ESS results -> {out_path}")
-    return df_out
-
-# -----------------------
-# Full orchestration
-# -----------------------
-def module1_and_plots(sheets: Dict[str, pd.DataFrame]):
-    # build net, run three scenarios: PV_0%, PV_x%, PV_x%_ESS
-    net0, bus_map, pv_map0, ess_map = create_network_from_sheets(sheets)
-    ok0 = run_pf_robust(net0)
-    res0 = collect_results(net0, bus_map)
-    res0["Scenario"] = "PV_0%"
-
-    # scenario with PV injection: use pv_static + additional scaling
-    net1, bus_map1, pv_map1, ess_map1 = create_network_from_sheets(sheets)
-    # add dynamic PV scaling from pv_timeseries if present: apply PV_RATIO_DEFAULT fraction of static or timeseries mean
-    # We'll simply add additional SGEN proportional to PV_RATIO_DEFAULT * existing or derived loads
-    # if pv_static exists we already created static sgen in create_network_from_sheets
-    # To simulate larger PV, create new sgens per bus proportional to load if needed
-    # We'll add small sgen per bus based on pv_map0 keys
+def plot_time_series_2d(results_all):
+    # if load_timeseries / pv_timeseries are provided, plot simple time series aggregated
     try:
-        # create additional PV sgens if pv_map0 empty: base on loads
-        if pv_map0:
-            for bus_idx, kw in pv_map0.items():
-                p_mw = (kw * PV_RATIO_DEFAULT) / 1000.0
-                if p_mw > 0:
-                    pp.create_sgen(net1, bus=bus_idx, p_mw=p_mw, q_mvar=0.0, name=f"PV_add_{bus_idx}")
-        else:
-            # fallback: create PV proportional to mean load per bus (if loads exist)
-            # try to compute per-bus load from net
-            if hasattr(net1, "load") and not net1.load.empty:
-                grouped = net1.load.groupby("bus").p_mw.sum().to_dict()
-                for bus_idx, p_mw in grouped.items():
-                    add = p_mw * PV_RATIO_DEFAULT
-                    pp.create_sgen(net1, bus=bus_idx, p_mw=add, q_mvar=0.0, name=f"PV_add_{bus_idx}")
-    except Exception as e:
-        debug(f"[WARN] adding PV for scenario 1: {e}")
-
-    ok1 = run_pf_robust(net1)
-    res1 = collect_results(net1, bus_map1)
-    res1["Scenario"] = f"PV_{int(PV_RATIO_DEFAULT*100)}%"
-
-    # scenario with ESS added (storage components)
-    net2, bus_map2, pv_map2, ess_map2 = create_network_from_sheets(sheets)
-    # add PV like above
-    try:
-        if pv_map0:
-            for bus_idx, kw in pv_map0.items():
-                p_mw = (kw * PV_RATIO_DEFAULT) / 1000.0
-                if p_mw > 0:
-                    pp.create_sgen(net2, bus=bus_idx, p_mw=p_mw, q_mvar=0.0, name=f"PV_add_{bus_idx}")
-    except Exception as e:
-        debug(f"[WARN] adding PV for net2: {e}")
-    # add ESS storages
-    try:
-        for bus_idx in bus_map2.values():
-            pp.create_storage(net2, bus=bus_idx, p_mw=0.0, max_e_mwh=ESS_CAP_kWh_DEFAULT/1000.0,
-                              sn_mva=ESS_Pmax_kW_DEFAULT/1000.0, controllable=True, name=f"ESS_{bus_idx}")
-    except Exception as e:
-        debug(f"[WARN] adding storages: {e}")
-    ok2 = run_pf_robust(net2)
-    res2 = collect_results(net2, bus_map2)
-    res2["Scenario"] = f"PV_{int(PV_RATIO_DEFAULT*100)}%_ESS"
-
-    results_all = pd.concat([res0, res1, res2], ignore_index=True)
-    # export
-    json_out = os.path.join(OUTPUT_DIR, "network_results.json")
-    csv_out = os.path.join(OUTPUT_DIR, "network_results.csv")
-    results_all.to_json(json_out, orient="records")
-    results_all.to_csv(csv_out, index=False)
-    debug(f"Module1: exported -> {json_out}, {csv_out}")
-
-    # Summaries and plots
-    summary = summarize_gains(results_all)
-    # plots
-    plot_line_voltage_by_scenario(results_all)
-    plot_bar_losses(results_all)
-    plot_heatmap_voltage(results_all)
-    plot_pv_capacity_by_depart(pv_map1 if pv_map1 else pv_map0, bus_map)
-    plot_comparative_gains(summary)
-    plot_gains_heatmap(summary)
-    plot_radar_metrics(summary)
-    plot_3d_surface_voltage(results_all)
-
-    # Additional 2D line per bus
-    try:
-        fig, ax = plt.subplots(figsize=(10,5))
-        for dep in results_all["Départ"].unique():
-            subset = results_all[results_all["Départ"]==dep]
-            sns.lineplot(x="Scenario", y="V_pu", data=subset, label=str(dep), marker="o", ax=ax)
-        ax.set_title("Tension par départ (ligne par départ) - scenarios")
+        # plot total PV production for PV_20% and PV_50% scenarios over timesteps (approx)
+        df = results_all.copy()
+        df_time = df.groupby(["t","Scenario"]).V_pu.mean().reset_index()
+        fig, ax = plt.subplots(figsize=(10,4))
+        sns.lineplot(data=df_time, x="t", y="V_pu", hue="Scenario", marker="o", ax=ax)
+        ax.set_title("Time series: tension moyenne par scénario")
         plt.xticks(rotation=45)
-        if SAVE_FIGURES: save_fig(fig, "voltage_by_depart_lines")
+        save_fig(fig, "lineplots_time_series_2D")
         plt.show()
     except Exception as e:
-        debug(f"[WARN] additional 2D line plot failed: {e}")
+        debug(f"[WARN] plot_time_series_2d failed: {e}")
 
-    return json_out, csv_out, results_all
-
-# -----------------------
-# Main CLI
-# -----------------------
+# ---------------------------
+# Orchestration main
+# ---------------------------
 def main():
+    debug("=== Début exécution ===")
+    # 1) run scenarios PV_0%, PV_20%, PV_50% and PV_50%_ESS placeholder
+    results_all, bus_map, pv_map, ess_map = run_all_scenarios(pv_scales=[0.0, 0.2, 0.5], include_ess=True)
+    if results_all.empty:
+        debug("[ERROR] Aucun résultat de PF — vérifie l'installation de pandapower ou les données.")
+    # 2) summaries
+    summary = summarize_by_scenario(results_all)
+    gains = compute_gains(summary)
+    # 3) try optimize ESS via Pyomo (proxy) otherwise heuristic
+    df_ess_schedule = None
     try:
-        path = find_input()
-    except Exception as e:
-        print(f"[FATAL] Input file not found: {e}")
-        sys.exit(1)
-
-    sheets = load_all_sheets(path)
-
-    # run module1 and plots
-    try:
-        json_out, csv_out, results_all = module1_and_plots(sheets)
-        debug("Module1 completed.")
-    except Exception as e:
-        debug(f"[ERROR] module1 failed: {e}")
-        traceback.print_exc()
-        results_all = pd.DataFrame()
-
-    # Module2: ESS optimisation if available else heuristic
-    pyomo_ok = (pyo is not None)
-    glpk_ok = False
-    if pyomo_ok:
-        try:
-            solver = pyo.SolverFactory("glpk")
-            glpk_ok = solver.available()
-        except Exception:
-            glpk_ok = False
-
-    try:
-        if pyomo_ok and glpk_ok:
-            debug("Running Pyomo optimisation (Module2).")
-            df_opt = run_ess_pyomo_opt(os.path.join(OUTPUT_DIR, "network_results.json"))
-            # plots: SOC and ESS pow
-            fig, ax = plt.subplots(figsize=(8,4))
-            sns.lineplot(data=df_opt, x="Départ", y="SOC_%_opt", marker="o", ax=ax)
-            ax.set_title("SOC ESS (optimisé)")
-            plt.xticks(rotation=45); plt.tight_layout()
-            if SAVE_FIGURES: save_fig(fig, "SOC_opt")
-            plt.show()
-
-            fig, ax = plt.subplots(figsize=(8,4))
-            sns.barplot(data=df_opt, x="Départ", y="P_ESS_kW_opt", ax=ax)
-            ax.set_title("Puissance ESS (optimisée)")
-            plt.xticks(rotation=45); plt.tight_layout()
-            if SAVE_FIGURES: save_fig(fig, "PESS_opt")
-            plt.show()
+        if pyo is not None:
+            df_ess_schedule = optimize_ess_pyomo(results_all, bus_map, ess_map)
+            ess_mode = "opt"
         else:
-            debug("Pyomo/GLPK not available; running heuristic ESS (Module2).")
-            df_heur = run_ess_heuristic(os.path.join(OUTPUT_DIR, "network_results.json"))
-            fig, ax = plt.subplots(figsize=(8,4))
-            sns.lineplot(data=df_heur, x="Départ", y="SOC_%_heur", marker="o", ax=ax)
-            ax.set_title("SOC ESS (heuristique)")
-            plt.xticks(rotation=45); plt.tight_layout()
-            if SAVE_FIGURES: save_fig(fig, "SOC_heur")
-            plt.show()
-
-            fig, ax = plt.subplots(figsize=(8,4))
-            sns.barplot(data=df_heur, x="Départ", y="P_ESS_kW_heur", ax=ax)
-            ax.set_title("Puissance ESS (heuristique)")
-            plt.xticks(rotation=45); plt.tight_layout()
-            if SAVE_FIGURES: save_fig(fig, "PESS_heur")
-            plt.show()
+            raise ImportError("Pyomo non installé")
     except Exception as e:
-        debug(f"[ERROR] Module2 failed: {e}")
+        debug(f"[WARN] optimisation Pyomo échouée ({e}) -> fallback heuristique.")
+        try:
+            df_ess_schedule = heuristic_ess_schedule(results_all, bus_map, ess_map)
+            ess_mode = "heur"
+        except Exception as e2:
+            debug(f"[ERROR] heuristique aussi échouée: {e2}")
+            df_ess_schedule = pd.DataFrame(columns=["Départ","t","P_ESS_kW_heur","SOC_kWh_heur","SOC_%_heur"])
+            ess_mode = "none"
+
+    # 4) apply ESS effects to PV_50%_ESS scenarios only (post-hoc)
+    results_with_ess = apply_ess_effects(results_all, df_ess_schedule, mode=("opt" if ess_mode=="opt" else "heur"))
+    # 5) Export main CSVs
+    try:
+        results_all.to_csv(os.path.join(OUTPUT_DIR,"network_results.csv"), index=False)
+        results_all.to_json(os.path.join(OUTPUT_DIR,"network_results.json"), orient="records")
+        results_with_ess.to_csv(os.path.join(OUTPUT_DIR,"network_results_with_ess.csv"), index=False)
+        summary.to_csv(os.path.join(OUTPUT_DIR,"summary_by_scenario.csv"), index=False)
+        gains.to_csv(os.path.join(OUTPUT_DIR,"gains_summary.csv"), index=False)
+        debug("Exports CSV/JSON écrits dans outputs/")
+    except Exception as e:
+        debug(f"[WARN] Erreur export CSV/JSON: {e}")
+
+    # 6) Generate all plots
+    try:
+        plot_voltage_profile_by_scenario(results_all)
+        plot_losses_by_scenario(results_all)
+        plot_voltage_heatmap(results_all)
+        plot_pv_capacity_by_depart(pv_map, bus_map)
+        plot_comparative_gains(gains)
+        plot_gains_heatmap(gains)
+        # ESS plots
+        if not df_ess_schedule.empty:
+            plot_soc_and_pess(df_ess_schedule, mode=("opt" if ess_mode=="opt" else "heur"))
+        plot_before_after_losses_and_voltage(results_with_ess)
+        plot_pv_capacity_phase_heatmap(pv_static, bus_map)
+        plot_radar_metrics(summary)
+        plot_surface_3d(results_all)
+        plot_time_series_2d(results_all)
+    except Exception as e:
+        debug(f"[WARN] Erreur lors génération figures: {e}")
         traceback.print_exc()
 
-    debug("All done. Check outputs/ for PNG and CSV files.")
+    debug("=== Fin exécution. Vérifie le dossier outputs/ pour les PNG et CSV. ===")
 
 if __name__ == "__main__":
     main()
